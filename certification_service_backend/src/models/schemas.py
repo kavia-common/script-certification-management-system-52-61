@@ -109,3 +109,32 @@ class PatchCertificationRequest(BaseModel):
     status: Optional[CertificationStatus] = Field(None, description="Update overall job status")
     environment: Optional[str] = Field(None, description="Update environment")
     metadata: Optional[Dict[str, Any]] = Field(None, description="Replace metadata dictionary")
+
+
+# Webhook payloads/responses
+
+class AirflowTaskEvent(BaseModel):
+    """Airflow task or DAG state event."""
+    run_id: str = Field(..., description="Certification run_id passed in conf when triggering DAG")
+    type: Optional[CertificationType] = Field(None, description="Certification type this task relates to (if per-type)")
+    state: str = Field(..., description="Airflow reported state e.g., success, failed, running")
+    task_id: Optional[str] = Field(None, description="Airflow task id (optional)")
+    dag_id: Optional[str] = Field(None, description="Airflow DAG id (optional)")
+    dag_run_id: Optional[str] = Field(None, description="Airflow dag_run_id (optional)")
+    logs_url: Optional[str] = Field(None, description="Optional URL to logs for this task or run")
+
+
+class WebhookAck(BaseModel):
+    """Generic webhook acknowledgement."""
+    accepted: bool = Field(..., description="Whether event was accepted and processed")
+    message: str = Field(..., description="Brief message")
+
+
+class GitLabWebhookPush(BaseModel):
+    """Subset of GitLab push/MR event fields used to optionally trigger a job."""
+    object_kind: str = Field(..., description="gitlab event kind e.g., push, merge_request")
+    project_id: Optional[int] = Field(None, description="Project id")
+    ref: Optional[str] = Field(None, description="Ref string like refs/heads/feature-x")
+    checkout_sha: Optional[str] = Field(None, description="Commit SHA")
+    project: Optional[Dict[str, Any]] = Field(None, description="Project object")
+    user_username: Optional[str] = Field(None, description="Triggering user")

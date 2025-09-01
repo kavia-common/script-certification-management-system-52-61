@@ -62,6 +62,10 @@ class Settings(BaseModel):
     # Site URL for auth/email callbacks (if later needed)
     site_url: Optional[AnyUrl] = Field(default=None, description="Public site URL for redirects and callbacks")
 
+    # Webhook security
+    webhook_secret: Optional[str] = Field(default=None, description="Shared secret to validate incoming webhooks (header: X-Webhook-Secret)")
+    gitlab_webhook_secret: Optional[str] = Field(default=None, description="Optional GitLab-specific secret (header: X-Gitlab-Token)")
+
     # Orchestration polling and retry
     orchestration_poll_interval: float = Field(default=10.0, description="Seconds between polling Airflow run status")
     orchestration_max_poll_seconds: float = Field(default=7200.0, description="Max seconds to poll before timeout")
@@ -116,6 +120,9 @@ class Settings(BaseModel):
             airflow_timeout=float(cls._get_env("AIRFLOW_TIMEOUT", "15.0")),
             airflow_dag_map=airflow_dag_map_default or None,  # None triggers default factory
             site_url=cls._get_env("SITE_URL"),
+            # webhook secrets (optional)
+            webhook_secret=cls._get_env("WEBHOOK_SECRET"),
+            gitlab_webhook_secret=cls._get_env("GITLAB_WEBHOOK_SECRET"),
             orchestration_poll_interval=float(cls._get_env("ORCH_POLL_INTERVAL", "10.0")),
             orchestration_max_poll_seconds=float(cls._get_env("ORCH_MAX_POLL_SECONDS", "7200.0")),
             orchestration_retry_attempts=int(cls._get_env("ORCH_RETRY_ATTEMPTS", "3")),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status, Header
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +18,7 @@ from ..core.repository import (
     list_metadata,
     patch_certification_job,
     upsert_metadata,
+    update_result_state_by_webhook,
 )
 from ..models.db_models import CertificationJob
 from ..models.schemas import (
@@ -29,6 +30,9 @@ from ..models.schemas import (
     MetadataUpsert,
     PatchCertificationRequest,
     TriggerCertificationRequest,
+    AirflowTaskEvent,
+    WebhookAck,
+    GitLabWebhookPush,
 )
 
 settings = get_settings()
@@ -38,6 +42,7 @@ openapi_tags = [
     {"name": "Certifications", "description": "Create and manage certification jobs"},
     {"name": "Mappings", "description": "Branch to environment mappings"},
     {"name": "Metadata", "description": "Certification metadata management"},
+    {"name": "Webhooks", "description": "Inbound webhook endpoints for orchestration updates and triggers"},
 ]
 
 app = FastAPI(
@@ -140,6 +145,76 @@ async def create_certification(
     # trigger background orchestration without blocking request
     background_tasks.add_task(_background_trigger_orchestration, job.run_id)
     return _job_to_response(job)
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/webhooks/gitlab",
+    tags=["Webhooks"],
+    summary="GitLab webhook (optional trigger)",
+    description="Optional: Trigger a default certification job from GitLab push/MR events. Secured via X-Gitlab-Token or X-Webhook-Secret.",
+    response_model=WebhookAck,
+    responses={
+        200: {"description": "Accepted"},
+        401: {"description": "Unauthorized"},
+    },
+)
+async def gitlab_webhook(
+    payload: GitLabWebhookPush,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db_session),
+    x_gitlab_token: Optional[str] = Header(default=None, alias="X-Gitlab-Token"),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> WebhookAck:
+    """Optionally accept GitLab push/MR events and trigger a certification job.
+    Minimal implementation: when object_kind in {push} it triggers job for the branch in `ref`.
+    Mapping of types/environment should be done by client metadata or defaults.
+    """
+    s = settings
+    expected_gl = s.gitlab_webhook_secret
+    expected_generic = s.webhook_secret
+    if expected_gl:
+        if (x_gitlab_token or "") != expected_gl:
+            raise HTTPException(status_code=401, detail="Invalid GitLab token")
+    elif expected_generic:
+        if (x_webhook_secret or "") != expected_generic:
+            raise HTTPException(status_code=401, detail="Invalid webhook secret")
+    # else if no secret configured, accept (dev mode)
+
+    # Only react to push events
+    if (payload.object_kind or "").lower() != "push":
+        return WebhookAck(accepted=True, message="Ignored event")
+
+    # Get branch from ref like 'refs/heads/feature-x'
+    ref = payload.ref or ""
+    branch = ref.split("/", 2)[-1] if ref.startswith("refs/") and "/" in ref else ref
+
+    # Build a default TriggerCertificationRequest; choose conservative type 'code_quality'
+    from ..models.schemas import RepositoryRef, TriggerCertificationRequest, CertificationType
+    if (not payload.project or "id" not in (payload.project or {})) and payload.project_id is None:
+        return WebhookAck(accepted=True, message="Missing project info; ignored")
+
+    project_id = str(payload.project.get("id") if payload.project else payload.project_id)
+    req = TriggerCertificationRequest(
+        repo=RepositoryRef(provider="gitlab", project_id=project_id, branch=branch, commit_sha=payload.checkout_sha),
+        types=[CertificationType.code_quality],
+        environment=None,
+        metadata={"trigger": "gitlab_webhook", "user": payload.user_username},
+    )
+    job = await create_certification_job(db, req)
+    await create_audit_log(
+        db,
+        action="create",
+        resource_type="certification_job",
+        resource_id=job.run_id,
+        actor=payload.user_username,
+        details={"provider": job.provider, "project_id": job.project_id, "branch": job.branch, "source": "gitlab_webhook"},
+    )
+    await db.commit()
+    # Trigger orchestration in background
+    background_tasks.add_task(_background_trigger_orchestration, job.run_id)
+
+    return WebhookAck(accepted=True, message="Triggered certification job")
 
 
 # PUBLIC_INTERFACE
@@ -320,3 +395,37 @@ async def post_metadata(
         created_at=item.created_at,
         updated_at=item.updated_at,
     )
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/webhooks/airflow",
+    tags=["Webhooks"],
+    summary="Airflow state webhook",
+    description="Receive Airflow DAG/task events to update certification states. Secured via X-Webhook-Secret header.",
+    response_model=WebhookAck,
+    responses={
+        200: {"description": "Accepted"},
+        401: {"description": "Unauthorized"},
+        400: {"description": "Invalid payload"},
+    },
+)
+async def airflow_webhook(
+    payload: AirflowTaskEvent,
+    db: AsyncSession = Depends(get_db_session),
+    x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+) -> WebhookAck:
+    """Accept Airflow callbacks to update result/job states by run_id and optional type.
+    The service uses shared secret validation. When accepted, updates the corresponding
+    CertificationResult and recomputes the aggregate CertificationJob status. Polling remains active concurrently.
+    """
+    s = settings
+    expected = s.webhook_secret
+    if expected and (x_webhook_secret or "") != expected:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    job = await update_result_state_by_webhook(db, run_id=payload.run_id, cert_type=payload.type, state=payload.state, logs_url=payload.logs_url)
+    if not job:
+        raise HTTPException(status_code=400, detail="Unknown run_id")
+    await db.commit()
+    return WebhookAck(accepted=True, message="Airflow event processed")

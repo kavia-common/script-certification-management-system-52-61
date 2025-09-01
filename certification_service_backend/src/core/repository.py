@@ -13,7 +13,7 @@ from ..models.db_models import (
     CertificationResult,
     MetadataItem,
 )
-from ..models.schemas import CertificationStatus, TriggerCertificationRequest, PatchCertificationRequest
+from ..models.schemas import CertificationStatus, TriggerCertificationRequest, PatchCertificationRequest, CertificationType
 from .repo_adapters import get_repo_adapter
 
 
@@ -169,3 +169,46 @@ async def upsert_metadata(session: AsyncSession, payload: Dict[str, Any]) -> Met
     session.add(item)
     await session.flush()
     return item
+
+
+# PUBLIC_INTERFACE
+async def update_result_state_by_webhook(session: AsyncSession, run_id: str, cert_type: Optional[CertificationType], state: str, logs_url: Optional[str] = None) -> Optional[CertificationJob]:
+    """Update CertificationResult status for a given run_id and optional type based on Airflow state."""
+    job = await get_certification_job_by_run_id(session, run_id)
+    if not job:
+        return None
+
+    def map_state(s: str) -> CertificationStatus:
+        sl = (s or "").lower()
+        if sl in {"success", "succeeded", "passed"}:
+            return CertificationStatus.passed
+        if sl in {"failed", "error"}:
+            return CertificationStatus.failed
+        if sl in {"running", "queued", "up_for_retry", "up_for_reschedule"}:
+            return CertificationStatus.running
+        if sl in {"canceled", "cancelled"}:
+            return CertificationStatus.cancelled
+        return CertificationStatus.pending
+
+    target_status = map_state(state)
+
+    # If type provided, update that specific result; else, update all results currently running/pending
+    if cert_type:
+        result = next((r for r in job.results if r.type == cert_type), None)
+        if result:
+            result.status = target_status
+            if logs_url:
+                result.logs_url = logs_url
+    else:
+        for r in job.results:
+            # Only update non-terminal if no specific type was provided
+            if r.status not in (CertificationStatus.passed, CertificationStatus.failed, CertificationStatus.cancelled):
+                r.status = target_status
+                if logs_url:
+                    r.logs_url = logs_url
+
+    # Recompute aggregate status similar to orchestration logic
+    from ..core.orchestration import _update_job_status  # local import to avoid cycle
+    await _update_job_status(session, job)
+    await session.flush()
+    return job

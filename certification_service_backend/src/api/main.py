@@ -5,6 +5,7 @@ import time
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from ..core.security import get_bearer_token_auth_dependency, validate_hmac_signature
 from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -96,12 +97,30 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             )
             raise
 
+# Normalize CORS config: if running in non-development and allow_origins is "*", restrict by env whitelist CORS_ALLOW_ORIGINS.
+cors_allow_origins = settings.cors_allow_origins or ["*"]
+if isinstance(cors_allow_origins, str):
+    cors_allow_origins = [cors_allow_origins]
+# Methods/headers may be strings ("*") per Settings; FastAPI accepts List[str] or ["*"]
+cors_allow_methods = settings.cors_allow_methods
+cors_allow_headers = settings.cors_allow_headers
+if isinstance(cors_allow_methods, str):
+    cors_allow_methods = [cors_allow_methods]
+if isinstance(cors_allow_headers, str):
+    cors_allow_headers = [cors_allow_headers]
+
+# If prod-like and "*" remains, lock down to no origins (must be provided) to be safe
+if settings.environment.lower() not in ("development", "dev"):
+    if cors_allow_origins == ["*"]:
+        # In production, require explicit origins via env. Default to empty (denies all).
+        cors_allow_origins = []
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_allow_origins,
+    allow_origins=cors_allow_origins,
     allow_credentials=settings.cors_allow_credentials,
-    allow_methods=settings.cors_allow_methods,
-    allow_headers=settings.cors_allow_headers,
+    allow_methods=cors_allow_methods,
+    allow_headers=cors_allow_headers,
 )
 app.add_middleware(RequestLoggingMiddleware)
 
@@ -195,6 +214,7 @@ async def create_certification(
     db: AsyncSession = Depends(get_db_session),
     request: Request = None,
     actor_header: Optional[str] = Depends(extract_actor_from_headers),
+    _auth: None = Depends(get_bearer_token_auth_dependency()),
 ) -> CertificationRunResponse:
     """Create a certification job, persist in DB, audit log, and trigger background orchestration.
 
@@ -268,6 +288,7 @@ async def gitlab_webhook(
     x_gitlab_token: Optional[str] = Header(default=None, alias="X-Gitlab-Token"),
     x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
     request: Request = None,
+    _sig_ok: None = Depends(validate_hmac_signature),
 ) -> WebhookAck:
     set_request_context_from_request(request)
     logger.info(
@@ -383,6 +404,7 @@ async def patch_certification(
     db: AsyncSession = Depends(get_db_session),
     request: Request = None,
     actor_header: Optional[str] = Depends(extract_actor_from_headers),
+    _auth: None = Depends(get_bearer_token_auth_dependency()),
 ) -> CertificationRunResponse:
     set_request_context_from_request(request)
     set_run_context(run_id=run_id, actor=actor_header or None)
@@ -458,6 +480,7 @@ async def post_mapping(
     db: AsyncSession = Depends(get_db_session),
     request: Request = None,
     actor_header: Optional[str] = Depends(extract_actor_from_headers),
+    _auth: None = Depends(get_bearer_token_auth_dependency()),
 ) -> MappingResponse:
     """Create a new branch-environment mapping and audit the operation.
 
@@ -537,6 +560,7 @@ async def post_metadata(
     db: AsyncSession = Depends(get_db_session),
     request: Request = None,
     actor_header: Optional[str] = Depends(extract_actor_from_headers),
+    _auth: None = Depends(get_bearer_token_auth_dependency()),
 ) -> MetadataItemResponse:
     """Upsert a metadata item (insert if not exists, else update).
 
@@ -588,6 +612,7 @@ async def airflow_webhook(
     db: AsyncSession = Depends(get_db_session),
     x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
     request: Request = None,
+    _sig_ok: None = Depends(validate_hmac_signature),
 ) -> WebhookAck:
     set_request_context_from_request(request)
     set_run_context(run_id=payload.run_id, actor="airflow", component="webhook")

@@ -32,6 +32,7 @@ The documentation reflects the current implementation in the repository. It incl
 - Method: POST
 - Path: /certifications
 - Summary: Create a certification job
+- Security: Bearer token required (Authorization: Bearer <token>) unless in development and AUTH_BEARER_TOKENS unset
 - Headers (optional for actor extraction): X-User-Id, X-User, X-Forwarded-User, Authorization
 - Request body: TriggerCertificationRequest
 - Responses:
@@ -56,6 +57,7 @@ Behavior:
 - Method: PATCH
 - Path: /certifications/{run_id}
 - Summary: Patch certification job
+- Security: Bearer token required (Authorization: Bearer <token>) unless in development and AUTH_BEARER_TOKENS unset
 - Headers (optional for actor extraction): X-User-Id, X-User, X-Forwarded-User, Authorization
 - Request body: PatchCertificationRequest
 - Responses:
@@ -77,6 +79,7 @@ Behavior:
 #### Create a branch-environment mapping
 - Method: POST
 - Path: /mappings
+- Security: Bearer token required (Authorization: Bearer <token>) unless in development and AUTH_BEARER_TOKENS unset
 - Headers (optional for actor extraction): X-User-Id, X-User, X-Forwarded-User, Authorization
 - Request body: MappingItem
 - Response: 201 Created -> MappingResponse
@@ -95,6 +98,7 @@ Behavior:
 #### Upsert metadata item
 - Method: POST
 - Path: /metadata
+- Security: Bearer token required (Authorization: Bearer <token>) unless in development and AUTH_BEARER_TOKENS unset
 - Headers (optional for actor extraction): X-User-Id, X-User, X-Forwarded-User, Authorization
 - Request body: MetadataUpsert
 - Response: 201 Created -> MetadataItemResponse
@@ -108,7 +112,9 @@ Behavior:
 #### GitLab webhook (optional trigger)
 - Method: POST
 - Path: /webhooks/gitlab
-- Headers (security): X-Gitlab-Token or X-Webhook-Secret if configured
+- Headers (security): X-Gitlab-Token or X-Webhook-Secret if configured; optional HMAC headers when WEBHOOK_HMAC_SECRET is set:
+  - X-Signature: hex-encoded HMAC of the raw body
+  - X-Signature-Algo: sha256 (default) or sha1
 - Request body: GitLabWebhookPush
 - Responses:
   - 200 OK -> WebhookAck (accepted/ignored)
@@ -121,7 +127,9 @@ Behavior:
 #### Airflow state webhook
 - Method: POST
 - Path: /webhooks/airflow
-- Headers (security): X-Webhook-Secret (if configured)
+- Headers (security): X-Webhook-Secret (if configured); optional HMAC headers when WEBHOOK_HMAC_SECRET is set:
+  - X-Signature: hex-encoded HMAC of the raw body
+  - X-Signature-Algo: sha256 (default) or sha1
 - Request body: AirflowTaskEvent
 - Responses:
   - 200 OK -> WebhookAck

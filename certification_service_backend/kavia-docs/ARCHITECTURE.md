@@ -45,7 +45,7 @@ This document summarizes the runtime architecture, main components, orchestratio
 ### Scheduler behavior
 - On startup, an in-process scheduler loop starts.
 - Periodically loads active jobs and for each non-terminal result attempts to fetch its Airflow state via dag_id/dag_run_id saved in metrics.
-- When a terminal state is detected, updates the result and recomputes job status; emits audit scheduler_update.
+- When a terminal state is detected, updates the result and recomputes the job status; emits audit scheduler_update.
 
 ### Mermaid sequence: Orchestration
 ```mermaid
@@ -90,15 +90,28 @@ sequenceDiagram
   end
 ```
 
+## Security and CORS
+
+- Bearer token authentication for mutating endpoints (POST/PATCH) is enforced via Authorization: Bearer <token>. Tokens are configured using the AUTH_BEARER_TOKENS environment variable (comma-separated). In development, if AUTH_BEARER_TOKENS is unset, mutating endpoints are allowed to ease local testing; in non-development environments, tokens are required.
+- Webhook security supports:
+  - Shared-secret headers: X-Webhook-Secret (WEBHOOK_SECRET) and X-Gitlab-Token (GITLAB_WEBHOOK_SECRET). If unset, development mode accepts requests.
+  - HMAC signature validation when WEBHOOK_HMAC_SECRET is set. Clients must include:
+    - X-Signature: hex-encoded HMAC of the raw request body.
+    - X-Signature-Algo: sha256 (default) or sha1.
+  Requests failing validation receive 401 Unauthorized.
+- CORS is environment-driven:
+  - Development: allow all origins by default.
+  - Non-development: wildcard "*" for CORS_ALLOW_ORIGINS is not permitted. If "*" is set, the service restricts to an empty whitelist (deny all) until explicit origins are provided via CORS_ALLOW_ORIGINS.
+
 ## Webhook Flows
 
 ### GitLab trigger
-- Validates X-Gitlab-Token or X-Webhook-Secret if configured; otherwise accepts in development.
+- Validates X-Gitlab-Token or X-Webhook-Secret if configured; optional HMAC signature validation if WEBHOOK_HMAC_SECRET is set.
 - For push events, creates a default certification job (type=code_quality) and triggers orchestration.
 - Emits audit webhook_create with payload snapshot and secrecy indicators.
 
 ### Airflow update
-- Validates X-Webhook-Secret if configured.
+- Validates X-Webhook-Secret if configured; optional HMAC signature validation if WEBHOOK_HMAC_SECRET is set.
 - Updates the specific result or all non-terminal results for the given run_id and recomputes the job status.
 - Emits audit webhook_update with payload snapshot and secrecy indicators.
 
@@ -114,4 +127,4 @@ sequenceDiagram
 ## Conclusion
 
 ### Summary
-The service provides an API-driven orchestration layer around Airflow with robust state reconciliation and comprehensive audit logging. Its configuration, adapters, and DAG mappings allow it to integrate cleanly into varied environments.
+The service provides an API-driven orchestration layer around Airflow with robust state reconciliation and comprehensive audit logging. Configuration is environment-driven, with bearer token auth for mutations, optional HMAC-secured webhooks, and production-safe CORS defaults. Its configuration, adapters, and DAG mappings allow it to integrate cleanly into varied environments.

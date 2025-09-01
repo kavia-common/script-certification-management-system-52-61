@@ -22,6 +22,8 @@ Only configuration that exists in the codebase is documented here.
 - CORS_ALLOW_CREDENTIALS: true/false. Default: true
 - CORS_ALLOW_METHODS: Comma-separated list or "*" (string accepted). Default: "*"
 - CORS_ALLOW_HEADERS: Comma-separated list or "*" (string accepted). Default: "*"
+Security note: In non-development environments, "*" for CORS_ALLOW_ORIGINS is not allowed; if "*" is set, the service will restrict to an empty list (deny all)
+until explicit origins are configured.
 
 ### Database
 - DATABASE_URL: SQLAlchemy async URL, e.g., postgresql+asyncpg://user:password@host:port/db
@@ -51,13 +53,20 @@ Only configuration that exists in the codebase is documented here.
 ### Webhooks security
 - WEBHOOK_SECRET: Shared secret for generic webhooks (header: X-Webhook-Secret)
 - GITLAB_WEBHOOK_SECRET: GitLab specific shared secret (header: X-Gitlab-Token)
-If both are unset, the service accepts webhook requests (development mode).
+- WEBHOOK_HMAC_SECRET: Secret used to validate HMAC signatures for webhook requests. Client must send:
+  - X-Signature: hex-encoded HMAC of the raw request body
+  - X-Signature-Algo: sha256 (default) or sha1
+If both header-based shared secrets are unset, the service accepts webhook requests in development mode. When WEBHOOK_HMAC_SECRET is set, signature validation is enforced.
 
 ### Orchestration and scheduler
 - ORCH_POLL_INTERVAL: Seconds between polling Airflow run status. Default: 10.0
 - ORCH_MAX_POLL_SECONDS: Max seconds to poll before timeout. Default: 7200.0
 - ORCH_RETRY_ATTEMPTS: Retry attempts for transient errors when triggering DAGs. Default: 3
 - ORCH_RETRY_BACKOFF: Exponential backoff base. Default: 1.5
+
+### Authentication
+- AUTH_BEARER_TOKENS: Comma-separated list of accepted bearer tokens. Required in non-development environments for mutating endpoints (POST/PATCH).
+  - In development, if unset, mutating endpoints are allowed without bearer token for local testing.
 
 ### Optional site URL
 - SITE_URL: Public site URL for future integrations

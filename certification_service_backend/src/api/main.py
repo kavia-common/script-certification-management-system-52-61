@@ -1,16 +1,308 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from __future__ import annotations
 
-app = FastAPI()
+from typing import List, Optional
+
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..core.config import get_settings
+from ..core.db import db_healthcheck, get_db_session
+from ..core.migrations import init_models
+from ..core.repository import (
+    create_audit_log,
+    create_certification_job,
+    create_mapping,
+    get_certification_job_by_run_id,
+    list_mappings,
+    list_metadata,
+    patch_certification_job,
+    upsert_metadata,
+)
+from ..models.db_models import CertificationJob
+from ..models.schemas import (
+    CertificationRunResponse,
+    HealthResponse,
+    MappingItem,
+    MappingResponse,
+    MetadataItemResponse,
+    MetadataUpsert,
+    PatchCertificationRequest,
+    TriggerCertificationRequest,
+)
+
+settings = get_settings()
+
+openapi_tags = [
+    {"name": "Health", "description": "Health and readiness endpoints"},
+    {"name": "Certifications", "description": "Create and manage certification jobs"},
+    {"name": "Mappings", "description": "Branch to environment mappings"},
+    {"name": "Metadata", "description": "Certification metadata management"},
+]
+
+app = FastAPI(
+    title=settings.app_name,
+    description="Service to manage and orchestrate certification jobs for scripts.",
+    version="0.1.0",
+    openapi_tags=openapi_tags,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.cors_allow_origins,
+    allow_credentials=settings.cors_allow_credentials,
+    allow_methods=settings.cors_allow_methods,
+    allow_headers=settings.cors_allow_headers,
 )
 
-@app.get("/")
-def health_check():
+
+async def _background_trigger_orchestration(run_id: str) -> None:
+    """Background task stub to trigger orchestration (e.g., Airflow DAG)."""
+    # This is a placeholder for integration with Airflow or other orchestrators.
+    # In a real implementation, we would enqueue the job in a task queue or call Airflow API.
+    # Here we do nothing to keep it non-blocking.
+    return None
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    """Initialize database models on startup (dev convenience)."""
+    await init_models()
+
+
+# PUBLIC_INTERFACE
+@app.get("/", tags=["Health"], summary="Health Check")
+def health_check_sync() -> dict:
+    """Quick synchronous health check."""
     return {"message": "Healthy"}
+
+
+# PUBLIC_INTERFACE
+@app.get("/health", tags=["Health"], summary="Health with DB status", response_model=HealthResponse)
+async def health_check() -> HealthResponse:
+    """Return health and DB connectivity status."""
+    ok = await db_healthcheck()
+    return HealthResponse(message="Healthy", db_connected=ok)
+
+
+def _job_to_response(job: CertificationJob) -> CertificationRunResponse:
+    return CertificationRunResponse(
+        run_id=job.run_id,
+        status=job.status,
+        created_at=job.created_at,
+        types=CertificationJob.csv_to_types(job.types_csv),
+        environment=job.environment,
+    )
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/certifications",
+    status_code=status.HTTP_201_CREATED,
+    tags=["Certifications"],
+    summary="Create a certification job",
+    response_model=CertificationRunResponse,
+    responses={
+        201: {"description": "Certification job created"},
+        400: {"description": "Invalid request"},
+    },
+)
+async def create_certification(
+    payload: TriggerCertificationRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db_session),
+) -> CertificationRunResponse:
+    """Create a certification job, persist in DB, audit log, and trigger background orchestration."""
+    job = await create_certification_job(db, payload)
+    await create_audit_log(
+        db,
+        action="create",
+        resource_type="certification_job",
+        resource_id=job.run_id,
+        actor=None,
+        details={"provider": job.provider, "project_id": job.project_id, "branch": job.branch},
+    )
+    await db.commit()
+    # trigger background orchestration without blocking request
+    background_tasks.add_task(_background_trigger_orchestration, job.run_id)
+    return _job_to_response(job)
+
+
+# PUBLIC_INTERFACE
+@app.get(
+    "/certifications/{run_id}",
+    tags=["Certifications"],
+    summary="Get certification job by run_id",
+    response_model=CertificationRunResponse,
+    responses={404: {"description": "Not found"}},
+)
+async def get_certification(
+    run_id: str,
+    db: AsyncSession = Depends(get_db_session),
+) -> CertificationRunResponse:
+    """Retrieve certification job by its run_id."""
+    job = await get_certification_job_by_run_id(db, run_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Certification job not found")
+    return _job_to_response(job)
+
+
+# PUBLIC_INTERFACE
+@app.patch(
+    "/certifications/{run_id}",
+    tags=["Certifications"],
+    summary="Patch certification job",
+    response_model=CertificationRunResponse,
+    responses={404: {"description": "Not found"}},
+)
+async def patch_certification(
+    run_id: str,
+    payload: PatchCertificationRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> CertificationRunResponse:
+    """Patch fields of an existing certification job and audit the change."""
+    job = await patch_certification_job(db, run_id, payload)
+    if not job:
+        raise HTTPException(status_code=404, detail="Certification job not found")
+    await create_audit_log(
+        db,
+        action="patch",
+        resource_type="certification_job",
+        resource_id=run_id,
+        actor=None,
+        details=payload.model_dump(exclude_none=True),
+    )
+    await db.commit()
+    return _job_to_response(job)
+
+
+# Mappings endpoints
+# PUBLIC_INTERFACE
+@app.get(
+    "/mappings",
+    tags=["Mappings"],
+    summary="List branch-environment mappings",
+    response_model=List[MappingResponse],
+)
+async def get_mappings(
+    provider: Optional[str] = Query(default=None, description="Filter by provider"),
+    project_id: Optional[str] = Query(default=None, description="Filter by project_id"),
+    db: AsyncSession = Depends(get_db_session),
+) -> List[MappingResponse]:
+    """List mappings filtered by optional provider and project_id."""
+    rows = await list_mappings(db, provider=provider, project_id=project_id)
+    return [
+        MappingResponse(
+            id=r.id,
+            provider=r.provider,
+            project_id=r.project_id,
+            branch_pattern=r.branch_pattern,
+            environment=r.environment,
+            is_active=r.is_active,
+            created_at=r.created_at,
+            updated_at=r.updated_at,
+        )
+        for r in rows
+    ]
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/mappings",
+    tags=["Mappings"],
+    summary="Create a branch-environment mapping",
+    status_code=status.HTTP_201_CREATED,
+    response_model=MappingResponse,
+)
+async def post_mapping(
+    payload: MappingItem,
+    db: AsyncSession = Depends(get_db_session),
+) -> MappingResponse:
+    """Create a new branch-environment mapping and audit the operation."""
+    mapping = await create_mapping(db, payload.model_dump())
+    await create_audit_log(
+        db,
+        action="create",
+        resource_type="mapping",
+        resource_id=str(mapping.id),
+        actor=None,
+        details=payload.model_dump(),
+    )
+    await db.commit()
+    return MappingResponse(
+        id=mapping.id,
+        provider=mapping.provider,
+        project_id=mapping.project_id,
+        branch_pattern=mapping.branch_pattern,
+        environment=mapping.environment,
+        is_active=mapping.is_active,
+        created_at=mapping.created_at,
+        updated_at=mapping.updated_at,
+    )
+
+
+# Metadata endpoints
+# PUBLIC_INTERFACE
+@app.get(
+    "/metadata",
+    tags=["Metadata"],
+    summary="List metadata",
+    response_model=List[MetadataItemResponse],
+)
+async def get_metadata(
+    key: Optional[str] = Query(default=None),
+    provider: Optional[str] = Query(default=None),
+    project_id: Optional[str] = Query(default=None),
+    branch: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db_session),
+) -> List[MetadataItemResponse]:
+    """List metadata items filtered by optional scope and key."""
+    items = await list_metadata(db, {"key": key, "provider": provider, "project_id": project_id, "branch": branch})
+    return [
+        MetadataItemResponse(
+            id=i.id,
+            key=i.key,
+            value=i.value,
+            provider=i.provider,
+            project_id=i.project_id,
+            branch=i.branch,
+            created_at=i.created_at,
+            updated_at=i.updated_at,
+        )
+        for i in items
+    ]
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/metadata",
+    tags=["Metadata"],
+    summary="Upsert metadata item",
+    response_model=MetadataItemResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def post_metadata(
+    payload: MetadataUpsert,
+    db: AsyncSession = Depends(get_db_session),
+) -> MetadataItemResponse:
+    """Upsert a metadata item (insert if not exists, else update)."""
+    item = await upsert_metadata(db, payload.model_dump())
+    await create_audit_log(
+        db,
+        action="upsert",
+        resource_type="metadata",
+        resource_id=str(item.id),
+        actor=None,
+        details=payload.model_dump(),
+    )
+    await db.commit()
+    return MetadataItemResponse(
+        id=item.id,
+        key=item.key,
+        value=item.value,
+        provider=item.provider,
+        project_id=item.project_id,
+        branch=item.branch,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )

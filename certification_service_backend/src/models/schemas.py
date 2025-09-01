@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -41,7 +41,7 @@ class TriggerCertificationRequest(BaseModel):
     repo: RepositoryRef = Field(..., description="Repository and ref details")
     types: List[CertificationType] = Field(..., description="Certification types to run")
     environment: Optional[str] = Field(None, description="Target environment mapping override")
-    metadata: Dict[str, str] = Field(default_factory=dict, description="Additional metadata to attach to the run")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata to attach to the run")
     notify_webhook: Optional[HttpUrl] = Field(None, description="Optional webhook to be called on status updates")
 
 
@@ -58,3 +58,54 @@ class HealthResponse(BaseModel):
     """Health check response."""
     message: str = Field(..., description="Service health message")
     db_connected: bool = Field(..., description="Whether DB connection succeeded")
+
+
+# Branch-environment mappings
+class MappingItem(BaseModel):
+    """Branch to environment mapping item."""
+    provider: str = Field(..., description="Source provider")
+    project_id: str = Field(..., description="Project identifier")
+    branch_pattern: str = Field(..., description="Glob/regex-like branch pattern")
+    environment: str = Field(..., description="Target environment")
+    is_active: bool = Field(default=True, description="Whether mapping is active")
+
+
+class MappingResponse(BaseModel):
+    """Response for mapping operations."""
+    id: int = Field(..., description="Mapping ID")
+    provider: str
+    project_id: str
+    branch_pattern: str
+    environment: str
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+# Metadata
+class MetadataUpsert(BaseModel):
+    """Create or update metadata entry."""
+    key: str = Field(..., description="Metadata key")
+    value: Dict[str, Any] = Field(..., description="Arbitrary JSON value")
+    provider: Optional[str] = Field(None, description="Optional scope provider")
+    project_id: Optional[str] = Field(None, description="Optional scope project ID")
+    branch: Optional[str] = Field(None, description="Optional scope branch")
+
+
+class MetadataItemResponse(BaseModel):
+    """Metadata row response."""
+    id: int
+    key: str
+    value: Dict[str, Any]
+    provider: Optional[str]
+    project_id: Optional[str]
+    branch: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class PatchCertificationRequest(BaseModel):
+    """Patch fields for an existing certification job."""
+    status: Optional[CertificationStatus] = Field(None, description="Update overall job status")
+    environment: Optional[str] = Field(None, description="Update environment")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Replace metadata dictionary")

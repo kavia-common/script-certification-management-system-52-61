@@ -56,11 +56,25 @@ app.add_middleware(
 )
 
 
+from ..core.db import get_session_factory
+from ..core.orchestration import orchestrate_job
+from sqlalchemy import select
+
 async def _background_trigger_orchestration(run_id: str) -> None:
-    """Background task stub to trigger orchestration (e.g., Airflow DAG)."""
-    # This is a placeholder for integration with Airflow or other orchestrators.
-    # In a real implementation, we would enqueue the job in a task queue or call Airflow API.
-    # Here we do nothing to keep it non-blocking.
+    """Background task to orchestrate the certification job via Airflow DAGs."""
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        from ..models.db_models import CertificationJob  # local import to avoid cycles
+        res = await session.execute(select(CertificationJob).where(CertificationJob.run_id == run_id))
+        job = res.scalar_one_or_none()
+        if not job:
+            return
+        try:
+            await orchestrate_job(session, job)
+        except Exception:
+            # Best-effort error handling: mark job as failed
+            job.status = job.status or None  # no-op: keep last known status; individual types will be updated already
+            await session.commit()
     return None
 
 

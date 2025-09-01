@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .airflow_client import get_airflow_client
 from .config import get_settings
 from .db import get_session_factory
+from .audit import create_audit_log
 from ..models.db_models import CertificationJob, CertificationResult
 from ..models.schemas import CertificationStatus
 
@@ -65,6 +66,20 @@ async def _reconcile_job(session: AsyncSession, job: CertificationJob) -> None:
             if state in {"success", "failed"}:
                 # Terminalize the result
                 r.status = CertificationStatus.passed if state == "success" else CertificationStatus.failed
+                # Audit this change as a scheduler-driven state transition
+                await create_audit_log(
+                    session,
+                    action="scheduler_update",
+                    resource_type="certification_result",
+                    resource_id=str(r.id),
+                    actor="scheduler",
+                    details={
+                        "job_run_id": job.run_id,
+                        "type": r.type.value,
+                        "new_status": r.status.value,
+                        "airflow": {"dag_id": dag_id, "dag_run_id": dag_run_id, "state": info.state},
+                    },
+                )
                 updated_any = True
         except Exception:
             # On error, do not flip state; rely on next runs or webhook

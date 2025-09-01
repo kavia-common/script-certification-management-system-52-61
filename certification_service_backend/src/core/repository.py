@@ -7,7 +7,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models.db_models import (
-    AuditLog,
     BranchEnvironmentMapping,
     CertificationJob,
     CertificationResult,
@@ -15,12 +14,6 @@ from ..models.db_models import (
 )
 from ..models.schemas import CertificationStatus, TriggerCertificationRequest, PatchCertificationRequest, CertificationType
 from .repo_adapters import get_repo_adapter
-
-
-# PUBLIC_INTERFACE
-async def create_audit_log(session: AsyncSession, action: str, resource_type: str, resource_id: Optional[str], actor: Optional[str], details: Optional[Dict[str, Any]] = None) -> None:
-    """Create an audit log entry for a mutating operation."""
-    session.add(AuditLog(action=action, resource_type=resource_type, resource_id=resource_id, actor=actor, details=details or {}))
 
 
 # PUBLIC_INTERFACE

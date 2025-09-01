@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status, Header
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +20,7 @@ from ..core.repository import (
     upsert_metadata,
     update_result_state_by_webhook,
 )
+from ..core.audit import extract_actor_from_headers, build_request_context
 from ..models.db_models import CertificationJob
 from ..models.schemas import (
     CertificationRunResponse,
@@ -140,16 +141,32 @@ async def create_certification(
     payload: TriggerCertificationRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db_session),
+    request: Request = None,
+    actor_header: Optional[str] = Depends(extract_actor_from_headers),
 ) -> CertificationRunResponse:
-    """Create a certification job, persist in DB, audit log, and trigger background orchestration."""
+    """Create a certification job, persist in DB, audit log, and trigger background orchestration.
+
+    Audit:
+    - action: create
+    - resource_type: certification_job
+    - resource_id: run_id
+    - actor: extracted from headers/token
+    - details: provider/project/branch, payload snapshot, and request context
+    """
     job = await create_certification_job(db, payload)
     await create_audit_log(
         db,
         action="create",
         resource_type="certification_job",
         resource_id=job.run_id,
-        actor=None,
-        details={"provider": job.provider, "project_id": job.project_id, "branch": job.branch},
+        actor=actor_header,
+        details={
+            "provider": job.provider,
+            "project_id": job.project_id,
+            "branch": job.branch,
+            "payload": payload.model_dump(exclude_none=True),
+            "request": build_request_context(request),
+        },
     )
     await db.commit()
     # trigger background orchestration without blocking request
@@ -175,6 +192,7 @@ async def gitlab_webhook(
     db: AsyncSession = Depends(get_db_session),
     x_gitlab_token: Optional[str] = Header(default=None, alias="X-Gitlab-Token"),
     x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+    request: Request = None,
 ) -> WebhookAck:
     """Optionally accept GitLab push/MR events and trigger a certification job.
     Minimal implementation: when object_kind in {push} it triggers job for the branch in `ref`.
@@ -214,11 +232,24 @@ async def gitlab_webhook(
     job = await create_certification_job(db, req)
     await create_audit_log(
         db,
-        action="create",
+        action="webhook_create",
         resource_type="certification_job",
         resource_id=job.run_id,
         actor=payload.user_username,
-        details={"provider": job.provider, "project_id": job.project_id, "branch": job.branch, "source": "gitlab_webhook"},
+        details={
+            "provider": job.provider,
+            "project_id": job.project_id,
+            "branch": job.branch,
+            "source": "gitlab_webhook",
+            "payload": payload.model_dump(exclude_none=True),
+            "request": {
+                **build_request_context(request),
+                "secrets_present": {
+                    "x_gitlab_token": bool(x_gitlab_token),
+                    "x_webhook_secret": bool(x_webhook_secret),
+                },
+            },
+        },
     )
     await db.commit()
     # Trigger orchestration in background
@@ -258,8 +289,18 @@ async def patch_certification(
     run_id: str,
     payload: PatchCertificationRequest,
     db: AsyncSession = Depends(get_db_session),
+    request: Request = None,
+    actor_header: Optional[str] = Depends(extract_actor_from_headers),
 ) -> CertificationRunResponse:
-    """Patch fields of an existing certification job and audit the change."""
+    """Patch fields of an existing certification job and audit the change.
+
+    Audit:
+    - action: patch
+    - resource_type: certification_job
+    - resource_id: run_id
+    - actor: extracted from headers
+    - details: patch payload and request context
+    """
     job = await patch_certification_job(db, run_id, payload)
     if not job:
         raise HTTPException(status_code=404, detail="Certification job not found")
@@ -268,8 +309,8 @@ async def patch_certification(
         action="patch",
         resource_type="certification_job",
         resource_id=run_id,
-        actor=None,
-        details=payload.model_dump(exclude_none=True),
+        actor=actor_header,
+        details={"payload": payload.model_dump(exclude_none=True), "request": build_request_context(request)},
     )
     await db.commit()
     return _job_to_response(job)
@@ -316,16 +357,26 @@ async def get_mappings(
 async def post_mapping(
     payload: MappingItem,
     db: AsyncSession = Depends(get_db_session),
+    request: Request = None,
+    actor_header: Optional[str] = Depends(extract_actor_from_headers),
 ) -> MappingResponse:
-    """Create a new branch-environment mapping and audit the operation."""
+    """Create a new branch-environment mapping and audit the operation.
+
+    Audit:
+    - action: create
+    - resource_type: mapping
+    - resource_id: id
+    - actor: extracted from headers
+    - details: payload and request context
+    """
     mapping = await create_mapping(db, payload.model_dump())
     await create_audit_log(
         db,
         action="create",
         resource_type="mapping",
         resource_id=str(mapping.id),
-        actor=None,
-        details=payload.model_dump(),
+        actor=actor_header,
+        details={"payload": payload.model_dump(), "request": build_request_context(request)},
     )
     await db.commit()
     return MappingResponse(
@@ -383,16 +434,26 @@ async def get_metadata(
 async def post_metadata(
     payload: MetadataUpsert,
     db: AsyncSession = Depends(get_db_session),
+    request: Request = None,
+    actor_header: Optional[str] = Depends(extract_actor_from_headers),
 ) -> MetadataItemResponse:
-    """Upsert a metadata item (insert if not exists, else update)."""
+    """Upsert a metadata item (insert if not exists, else update).
+
+    Audit:
+    - action: upsert
+    - resource_type: metadata
+    - resource_id: id
+    - actor: extracted from headers
+    - details: payload and request context
+    """
     item = await upsert_metadata(db, payload.model_dump())
     await create_audit_log(
         db,
         action="upsert",
         resource_type="metadata",
         resource_id=str(item.id),
-        actor=None,
-        details=payload.model_dump(),
+        actor=actor_header,
+        details={"payload": payload.model_dump(), "request": build_request_context(request)},
     )
     await db.commit()
     return MetadataItemResponse(
@@ -424,10 +485,18 @@ async def airflow_webhook(
     payload: AirflowTaskEvent,
     db: AsyncSession = Depends(get_db_session),
     x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
+    request: Request = None,
 ) -> WebhookAck:
     """Accept Airflow callbacks to update result/job states by run_id and optional type.
     The service uses shared secret validation. When accepted, updates the corresponding
     CertificationResult and recomputes the aggregate CertificationJob status. Polling remains active concurrently.
+
+    Audit:
+    - action: webhook_update
+    - resource_type: certification_job
+    - resource_id: run_id
+    - actor: 'airflow' (system) when secret checked, else None (dev)
+    - details: payload snapshot, request context, token presence indicator
     """
     s = settings
     expected = s.webhook_secret
@@ -437,5 +506,22 @@ async def airflow_webhook(
     job = await update_result_state_by_webhook(db, run_id=payload.run_id, cert_type=payload.type, state=payload.state, logs_url=payload.logs_url)
     if not job:
         raise HTTPException(status_code=400, detail="Unknown run_id")
+
+    # audit webhook
+    await create_audit_log(
+        db,
+        action="webhook_update",
+        resource_type="certification_job",
+        resource_id=payload.run_id,
+        actor="airflow" if expected else None,
+        details={
+            "payload": payload.model_dump(exclude_none=True),
+            "request": {
+                **build_request_context(request),
+                "secrets_present": {"x_webhook_secret": bool(x_webhook_secret)},
+            },
+        },
+    )
+
     await db.commit()
     return WebhookAck(accepted=True, message="Airflow event processed")

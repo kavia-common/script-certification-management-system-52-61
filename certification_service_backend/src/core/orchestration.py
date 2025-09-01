@@ -11,6 +11,7 @@ from ..models.db_models import CertificationJob
 from ..models.schemas import CertificationStatus, CertificationType
 from .airflow_client import get_airflow_client
 from .config import get_settings
+from .audit import create_audit_log
 
 
 async def _with_retries(coro_fn, attempts: int, backoff: float, base_delay: float = 0.5):
@@ -69,6 +70,15 @@ async def _mark_running(session: AsyncSession, job: CertificationJob, cert_type:
         result.status = CertificationStatus.running
         await session.flush()
         await _update_job_status(session, job)
+        # Audit running transition
+        await create_audit_log(
+            session,
+            action="orchestrate_running",
+            resource_type="certification_result",
+            resource_id=str(result.id),
+            actor="orchestrator",
+            details={"job_run_id": job.run_id, "type": cert_type.value},
+        )
 
 
 async def _mark_terminal(session: AsyncSession, job: CertificationJob, cert_type: CertificationType, success: bool, logs_url: Optional[str] = None) -> None:
@@ -79,6 +89,15 @@ async def _mark_terminal(session: AsyncSession, job: CertificationJob, cert_type
             result.logs_url = logs_url
         await session.flush()
         await _update_job_status(session, job)
+        # Audit terminalization
+        await create_audit_log(
+            session,
+            action="orchestrate_terminal",
+            resource_type="certification_result",
+            resource_id=str(result.id),
+            actor="orchestrator",
+            details={"job_run_id": job.run_id, "type": cert_type.value, "success": success, "logs_url": logs_url},
+        )
 
 
 async def _poll_one(session_factory, job_run_id: str, cert_type: CertificationType, dag_id: str, dag_run_id: str) -> None:
@@ -145,6 +164,20 @@ async def orchestrate_job(session: AsyncSession, job: CertificationJob) -> None:
             )
             await _mark_running(session, job, ct)
             await _save_dag_run_info(session, job, ct, dag_run_id=dag_run.dag_run_id)
+            # Audit trigger with dag run
+            await create_audit_log(
+                session,
+                action="orchestrate_trigger",
+                resource_type="certification_result",
+                resource_id=None,
+                actor="orchestrator",
+                details={
+                    "job_run_id": job.run_id,
+                    "type": ct.value,
+                    "dag_id": d_id,
+                    "dag_run_id": dag_run.dag_run_id,
+                },
+            )
             await session.commit()
             # start background polling
             poll_tasks.append(asyncio.create_task(_poll_one(session_factory, job.run_id, ct, d_id, dag_run.dag_run_id)))

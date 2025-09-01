@@ -70,7 +70,7 @@ class AirflowClient:
 
     # PUBLIC_INTERFACE
     async def get_dag_run(self, dag_id: str, dag_run_id: str) -> DagRunInfo:
-        """Fetch DAG run status by dag_id and dag_run_id."""
+        """Fetch DAG run status by dag_id and dag_run_id. Used by orchestrator and in-process scheduler."""
         await self._ensure_client()
         assert self._client is not None
         url = f"/api/v1/dags/{dag_id}/dagRuns/{dag_run_id}"

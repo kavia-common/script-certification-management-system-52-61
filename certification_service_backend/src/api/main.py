@@ -85,8 +85,11 @@ async def _background_trigger_orchestration(run_id: str) -> None:
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    """Initialize database models on startup (dev convenience)."""
+    """Initialize database models on startup (dev convenience) and start scheduler."""
     await init_models()
+    # Start in-process scheduler for job reconciliation
+    from ..core.scheduler import start_scheduler
+    await start_scheduler()
 
 
 # PUBLIC_INTERFACE
@@ -94,6 +97,13 @@ async def on_startup() -> None:
 def health_check_sync() -> dict:
     """Quick synchronous health check."""
     return {"message": "Healthy"}
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    """Gracefully stop scheduler."""
+    from ..core.scheduler import stop_scheduler
+    await stop_scheduler()
 
 
 # PUBLIC_INTERFACE

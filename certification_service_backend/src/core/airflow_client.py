@@ -7,6 +7,9 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .config import get_settings
+from .logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class DagRunInfo(BaseModel):
@@ -57,9 +60,14 @@ class AirflowClient:
         payload = {"conf": conf or {}}
         # Airflow 2.3+: POST /api/v1/dags/{dag_id}/dagRuns OR /api/v1/dags/{dag_id}/dagRuns for v1; many use v2 with same path
         url = f"/api/v1/dags/{dag_id}/dagRuns"
+        logger.info("Airflow trigger request", extra={"event": "airflow_trigger_request", "dag_id": dag_id})
         res = await self._client.post(url, json=payload)
         res.raise_for_status()
         data = res.json()
+        logger.info(
+            "Airflow trigger response",
+            extra={"event": "airflow_trigger_response", "dag_id": dag_id, "dag_run_id": data.get("dag_run_id") or data.get("run_id"), "state": data.get("state")},
+        )
         return DagRunInfo(
             dag_id=dag_id,
             dag_run_id=data.get("dag_run_id") or data.get("run_id") or data.get("dag_run_id", ""),
@@ -77,6 +85,10 @@ class AirflowClient:
         res = await self._client.get(url)
         res.raise_for_status()
         data = res.json()
+        logger.info(
+            "Airflow get dag run",
+            extra={"event": "airflow_get_dag_run", "dag_id": dag_id, "dag_run_id": dag_run_id, "state": data.get("state")},
+        )
         return DagRunInfo(
             dag_id=dag_id,
             dag_run_id=data.get("dag_run_id") or data.get("run_id") or dag_run_id,

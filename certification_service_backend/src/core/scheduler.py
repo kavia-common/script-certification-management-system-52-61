@@ -11,8 +11,11 @@ from .airflow_client import get_airflow_client
 from .config import get_settings
 from .db import get_session_factory
 from .audit import create_audit_log
+from .logging_utils import get_logger, set_run_context
 from ..models.db_models import CertificationJob, CertificationResult
 from ..models.schemas import CertificationStatus
+
+logger = get_logger(__name__)
 
 
 class _SchedulerState:
@@ -100,6 +103,7 @@ async def _scheduler_loop() -> None:
 
     stop_evt = _state.stop_event()
 
+    logger.info("Scheduler loop started", extra={"event": "scheduler_loop_start"})
     while not stop_evt.is_set():
         try:
             async with session_factory() as session:
@@ -132,14 +136,17 @@ async def _scheduler_loop() -> None:
                     _ = job.results  # access relationship
 
                 for job in jobs:
+                    set_run_context(run_id=job.run_id, actor="scheduler", component="scheduler")
                     await _reconcile_job(session, job)
 
                 await session.commit()
+                logger.info("Scheduler cycle complete", extra={"event": "scheduler_cycle", "jobs_checked": len(jobs)})
         except Exception:
             # Avoid crashing the loop on transient errors
             with suppress(Exception):
                 async with session_factory() as s2:
                     await s2.rollback()
+            logger.exception("Scheduler cycle error", extra={"event": "scheduler_cycle_error"})
             # Sleep a minimal backoff before retry cycle
             await asyncio.sleep(poll_interval)
         else:
@@ -169,3 +176,4 @@ async def stop_scheduler() -> None:
         with suppress(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=10.0)
     _state.clear()
+    logger.info("Scheduler loop stopped", extra={"event": "scheduler_loop_stop"})

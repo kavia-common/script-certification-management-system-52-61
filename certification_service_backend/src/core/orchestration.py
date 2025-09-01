@@ -4,6 +4,9 @@ import asyncio
 import math
 from typing import List, Optional
 
+from .logging_utils import get_logger
+logger = get_logger(__name__)
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 

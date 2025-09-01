@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from typing import List, Optional
+import time
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, status, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.config import get_settings
@@ -21,6 +23,7 @@ from ..core.repository import (
     update_result_state_by_webhook,
 )
 from ..core.audit import extract_actor_from_headers, build_request_context
+from ..core.logging_utils import init_logging, get_logger, set_request_context_from_request, set_run_context
 from ..models.db_models import CertificationJob
 from ..models.schemas import (
     CertificationRunResponse,
@@ -37,6 +40,7 @@ from ..models.schemas import (
 )
 
 settings = get_settings()
+logger = get_logger(__name__)
 
 openapi_tags = [
     {"name": "Health", "description": "Health and readiness endpoints"},
@@ -53,6 +57,45 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
+# Initialize structured logging for API component
+init_logging(component="api")
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """Middleware to set request_id context and emit structured access logs."""
+
+    async def dispatch(self, request: Request, call_next):
+        rid = set_request_context_from_request(request)
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            logger.info(
+                "HTTP request",
+                extra={
+                    "event": "http_request",
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": getattr(response, "status_code", None),
+                    "duration_ms": round(duration_ms, 2),
+                    "request_id": rid,
+                },
+            )
+            return response
+        except Exception:
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            logger.exception(
+                "HTTP request failed",
+                extra={
+                    "event": "http_request_error",
+                    "method": request.method,
+                    "path": request.url.path,
+                    "duration_ms": round(duration_ms, 2),
+                    "request_id": rid,
+                },
+            )
+            raise
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allow_origins,
@@ -60,6 +103,7 @@ app.add_middleware(
     allow_methods=settings.cors_allow_methods,
     allow_headers=settings.cors_allow_headers,
 )
+app.add_middleware(RequestLoggingMiddleware)
 
 
 from ..core.db import get_session_factory
@@ -68,18 +112,23 @@ from sqlalchemy import select
 
 async def _background_trigger_orchestration(run_id: str) -> None:
     """Background task to orchestrate the certification job via Airflow DAGs."""
+    set_run_context(run_id=run_id, actor="orchestrator", component="orchestrator")
     session_factory = get_session_factory()
     async with session_factory() as session:
         from ..models.db_models import CertificationJob  # local import to avoid cycles
         res = await session.execute(select(CertificationJob).where(CertificationJob.run_id == run_id))
         job = res.scalar_one_or_none()
         if not job:
+            logger.warning("Orchestration skipped: job not found", extra={"event": "orchestrate_missing_job", "run_id": run_id})
             return
+        logger.info("Orchestration started", extra={"event": "orchestrate_start", "run_id": run_id, "types": [t.value for t in CertificationJob.csv_to_types(job.types_csv)]})
         try:
             await orchestrate_job(session, job)
+            logger.info("Orchestration dispatched", extra={"event": "orchestrate_dispatched", "run_id": run_id})
         except Exception:
             # Best-effort error handling: mark job as failed
-            job.status = job.status or None  # no-op: keep last known status; individual types will be updated already
+            logger.exception("Orchestration dispatch failed", extra={"event": "orchestrate_error", "run_id": run_id})
+            job.status = job.status or None  # keep last known status
             await session.commit()
     return None
 
@@ -87,10 +136,12 @@ async def _background_trigger_orchestration(run_id: str) -> None:
 @app.on_event("startup")
 async def on_startup() -> None:
     """Initialize database models on startup (dev convenience) and start scheduler."""
+    logger.info("App startup", extra={"event": "app_startup"})
     await init_models()
     # Start in-process scheduler for job reconciliation
     from ..core.scheduler import start_scheduler
     await start_scheduler()
+    logger.info("Scheduler started", extra={"event": "scheduler_started"})
 
 
 # PUBLIC_INTERFACE
@@ -105,6 +156,7 @@ async def on_shutdown() -> None:
     """Gracefully stop scheduler."""
     from ..core.scheduler import stop_scheduler
     await stop_scheduler()
+    logger.info("App shutdown", extra={"event": "app_shutdown"})
 
 
 # PUBLIC_INTERFACE
@@ -153,7 +205,30 @@ async def create_certification(
     - actor: extracted from headers/token
     - details: provider/project/branch, payload snapshot, and request context
     """
+    # set context for subsequent logs
+    set_request_context_from_request(request)
+    logger.info(
+        "Create certification requested",
+        extra={
+            "event": "create_certification_request",
+            "provider": payload.repo.provider,
+            "project_id": payload.repo.project_id,
+            "branch": payload.repo.branch,
+            "types": [t.value for t in payload.types],
+        },
+    )
     job = await create_certification_job(db, payload)
+    set_run_context(run_id=job.run_id, actor=actor_header or None)
+    logger.info(
+        "Certification job created",
+        extra={
+            "event": "cert_job_created",
+            "run_id": job.run_id,
+            "status": job.status.value,
+            "types": [t.value for t in CertificationJob.csv_to_types(job.types_csv)],
+            "environment": job.environment,
+        },
+    )
     await create_audit_log(
         db,
         action="create",
@@ -194,6 +269,16 @@ async def gitlab_webhook(
     x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
     request: Request = None,
 ) -> WebhookAck:
+    set_request_context_from_request(request)
+    logger.info(
+        "GitLab webhook received",
+        extra={
+            "event": "gitlab_webhook_in",
+            "object_kind": payload.object_kind,
+            "has_token": bool(x_gitlab_token),
+            "has_secret": bool(x_webhook_secret),
+        },
+    )
     """Optionally accept GitLab push/MR events and trigger a certification job.
     Minimal implementation: when object_kind in {push} it triggers job for the branch in `ref`.
     Mapping of types/environment should be done by client metadata or defaults.
@@ -254,6 +339,10 @@ async def gitlab_webhook(
     await db.commit()
     # Trigger orchestration in background
     background_tasks.add_task(_background_trigger_orchestration, job.run_id)
+    logger.info(
+        "GitLab webhook triggered job",
+        extra={"event": "gitlab_webhook_triggered", "run_id": job.run_id, "project_id": job.project_id, "branch": job.branch},
+    )
 
     return WebhookAck(accepted=True, message="Triggered certification job")
 
@@ -271,9 +360,12 @@ async def get_certification(
     db: AsyncSession = Depends(get_db_session),
 ) -> CertificationRunResponse:
     """Retrieve certification job by its run_id."""
+    set_run_context(run_id=run_id)
     job = await get_certification_job_by_run_id(db, run_id)
     if not job:
+        logger.warning("Certification job not found", extra={"event": "get_cert_not_found", "run_id": run_id})
         raise HTTPException(status_code=404, detail="Certification job not found")
+    logger.info("Certification job fetched", extra={"event": "get_cert_ok", "run_id": run_id, "status": job.status.value})
     return _job_to_response(job)
 
 
@@ -292,6 +384,9 @@ async def patch_certification(
     request: Request = None,
     actor_header: Optional[str] = Depends(extract_actor_from_headers),
 ) -> CertificationRunResponse:
+    set_request_context_from_request(request)
+    set_run_context(run_id=run_id, actor=actor_header or None)
+    logger.info("Patch certification requested", extra={"event": "patch_cert_request", "run_id": run_id, "fields": list(payload.model_dump(exclude_none=True).keys())})
     """Patch fields of an existing certification job and audit the change.
 
     Audit:
@@ -331,6 +426,10 @@ async def get_mappings(
 ) -> List[MappingResponse]:
     """List mappings filtered by optional provider and project_id."""
     rows = await list_mappings(db, provider=provider, project_id=project_id)
+    logger.info(
+        "List mappings",
+        extra={"event": "list_mappings", "count": len(rows), "provider": provider, "project_id": project_id},
+    )
     return [
         MappingResponse(
             id=r.id,
@@ -370,6 +469,7 @@ async def post_mapping(
     - details: payload and request context
     """
     mapping = await create_mapping(db, payload.model_dump())
+    logger.info("Mapping created", extra={"event": "create_mapping", "mapping_id": mapping.id, "provider": mapping.provider, "project_id": mapping.project_id})
     await create_audit_log(
         db,
         action="create",
@@ -408,6 +508,7 @@ async def get_metadata(
 ) -> List[MetadataItemResponse]:
     """List metadata items filtered by optional scope and key."""
     items = await list_metadata(db, {"key": key, "provider": provider, "project_id": project_id, "branch": branch})
+    logger.info("List metadata", extra={"event": "list_metadata", "count": len(items)})
     return [
         MetadataItemResponse(
             id=i.id,
@@ -447,6 +548,7 @@ async def post_metadata(
     - details: payload and request context
     """
     item = await upsert_metadata(db, payload.model_dump())
+    logger.info("Metadata upserted", extra={"event": "upsert_metadata", "id": item.id, "key": item.key})
     await create_audit_log(
         db,
         action="upsert",
@@ -487,6 +589,12 @@ async def airflow_webhook(
     x_webhook_secret: Optional[str] = Header(default=None, alias="X-Webhook-Secret"),
     request: Request = None,
 ) -> WebhookAck:
+    set_request_context_from_request(request)
+    set_run_context(run_id=payload.run_id, actor="airflow", component="webhook")
+    logger.info(
+        "Airflow webhook received",
+        extra={"event": "airflow_webhook_in", "run_id": payload.run_id, "type": getattr(payload.type, "value", None), "state": payload.state},
+    )
     """Accept Airflow callbacks to update result/job states by run_id and optional type.
     The service uses shared secret validation. When accepted, updates the corresponding
     CertificationResult and recomputes the aggregate CertificationJob status. Polling remains active concurrently.
@@ -505,7 +613,12 @@ async def airflow_webhook(
 
     job = await update_result_state_by_webhook(db, run_id=payload.run_id, cert_type=payload.type, state=payload.state, logs_url=payload.logs_url)
     if not job:
+        logger.warning("Airflow webhook unknown run_id", extra={"event": "airflow_webhook_unknown", "run_id": payload.run_id})
         raise HTTPException(status_code=400, detail="Unknown run_id")
+    logger.info(
+        "Airflow webhook processed",
+        extra={"event": "airflow_webhook_processed", "run_id": payload.run_id, "new_status": job.status.value},
+    )
 
     # audit webhook
     await create_audit_log(

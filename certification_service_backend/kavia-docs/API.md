@@ -184,6 +184,19 @@ An up-to-date OpenAPI schema is checked in at:
 Regenerate using:
 - python -m src.api.generate_openapi (ensures app import and writes to interfaces/openapi.json)
 
+## Logging and Correlation
+
+The backend emits structured JSON logs. Common fields include:
+- request_id: Set per HTTP request (from X-Request-Id if provided, otherwise generated).
+- run_id: Set when a certification run is created or processed (orchestrator, scheduler, webhooks).
+- actor: Derived from headers for user operations, or system components ("orchestrator", "scheduler", "airflow").
+- component: api | orchestrator | scheduler | webhook.
+- event: Machine-friendly event name (e.g., http_request, cert_job_created, dag_triggered).
+
+Client guidance:
+- Provide X-Request-Id in API requests to correlate access logs and endpoint handling.
+- Use the run_id returned by POST /certifications to filter orchestration, scheduler, and webhook logs for that run.
+
 ## Examples
 
 ### Create certification

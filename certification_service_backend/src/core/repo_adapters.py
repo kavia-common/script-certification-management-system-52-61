@@ -7,6 +7,12 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .config import get_settings
+from .logging_utils import get_logger
+
+logger = get_logger(__name__)
+from .logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class RepoInfo(BaseModel):

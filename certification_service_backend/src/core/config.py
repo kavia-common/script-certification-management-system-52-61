@@ -35,9 +35,9 @@ class Settings(BaseModel):
         description="SQLAlchemy-style async database URL",
     )
 
-    # External integrations (placeholders to be expanded later)
-    gitlab_base_url: Optional[AnyUrl] = Field(default=None, description="Base URL for GitLab API")
-    gitlab_token: Optional[str] = Field(default=None, description="Personal access token for GitLab")
+    # External integrations (repository providers)
+    gitlab_base_url: Optional[AnyUrl] = Field(default=None, description="Base URL for GitLab API (e.g., https://gitlab.com or self-hosted)")
+    gitlab_token: Optional[str] = Field(default=None, description="Personal access token for GitLab with read_api scope")
 
     # Airflow configuration
     airflow_base_url: Optional[AnyUrl] = Field(default=None, description="Base URL to reach Airflow API")

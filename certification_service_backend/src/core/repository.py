@@ -14,6 +14,7 @@ from ..models.db_models import (
     MetadataItem,
 )
 from ..models.schemas import CertificationStatus, TriggerCertificationRequest, PatchCertificationRequest
+from .repo_adapters import get_repo_adapter
 
 
 # PUBLIC_INTERFACE
@@ -24,18 +25,48 @@ async def create_audit_log(session: AsyncSession, action: str, resource_type: st
 
 # PUBLIC_INTERFACE
 async def create_certification_job(session: AsyncSession, req: TriggerCertificationRequest) -> CertificationJob:
-    """Create a new certification job and its per-type result rows."""
+    """Create a new certification job and its per-type result rows. If commit SHA is not provided, try to resolve via repo adapter. Attach repo metadata."""
     run_id = uuid.uuid4().hex[:16]
+
+    # Resolve repo info using pluggable adapter
+    resolved_sha = req.repo.commit_sha
+    repo_meta: Dict[str, Any] = {}
+    adapter = get_repo_adapter(req.repo.provider)
+    if adapter:
+        try:
+            info = await adapter.get_repo_info(project_id=req.repo.project_id, branch=req.repo.branch, commit_sha=req.repo.commit_sha)
+            resolved_sha = resolved_sha or info.commit_sha
+            # Prepare minimal, stable metadata to store under "repo"
+            repo_meta = {
+                "provider": info.provider,
+                "project_id": info.project_id,
+                "branch": info.branch,
+                "commit_sha": info.commit_sha,
+                "default_branch": info.default_branch,
+                "web_url": info.web_url,
+                "description": info.description,
+                "namespace": info.namespace,
+                "visibility": info.visibility,
+            }
+        except Exception:
+            # Non-blocking failure: proceed without enriched metadata
+            repo_meta = {}
+
+    base_metadata = req.metadata or {}
+    if repo_meta:
+        # Surface under a dedicated key to avoid collisions
+        base_metadata = {**base_metadata, "repo": repo_meta}
+
     job = CertificationJob(
         run_id=run_id,
         provider=req.repo.provider,
         project_id=req.repo.project_id,
         branch=req.repo.branch,
-        commit_sha=req.repo.commit_sha,
+        commit_sha=resolved_sha,
         types_csv=CertificationJob.types_to_csv(req.types),
         environment=req.environment,
         status=CertificationStatus.pending,
-        metadata=req.metadata or {},
+        metadata=base_metadata,
         notify_webhook=str(req.notify_webhook) if req.notify_webhook else None,
     )
     session.add(job)
